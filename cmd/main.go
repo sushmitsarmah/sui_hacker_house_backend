@@ -17,9 +17,9 @@ import (
 
 	// Viper included via config package
 
-	"sui_ai_server/ai"
-	"sui_ai_server/api"
 	"sui_ai_server/config"
+	"sui_ai_server/internal/ai"
+	"sui_ai_server/internal/api"
 	// neo4jRepo "sui_ai_server/db/neo4j" // Alias to avoid name collision
 	// "sui_ai_server/events"
 	// "sui_ai_server/rag"

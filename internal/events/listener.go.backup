@@ -1,0 +1,245 @@
+// sui_ai_server/events/listener.go
+package events
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"sui_ai_server/db/neo4j"
+	"sui_ai_server/sui/seal"
+	"sui_ai_server/sui/walrus"
+	"time"
+
+	// Import necessary Sui SDK packages
+	// e.g., "github.com/MystenLabs/sui-go-sdk/v2/sui"
+	// e.g., "github.com/MystenLabs/sui-go-sdk/v2/types"
+	// Use the actual SDK imports once chosen and available
+	// Placeholder for direct RPC call if SDK is complex/unavailable
+	sui_json_rpc "github.com/coming-chat/go-sui/client"
+	"github.com/coming-chat/go-sui/types"
+)
+
+// Define expected event structures based on your Sui Move contract
+// These names MUST match the struct names in your Move code.
+type SubscriptionCreatedEvent struct {
+	Subscriber types.Address `json:"subscriber"`
+	// Add other relevant fields from your event struct
+}
+
+type SiteDeployedEvent struct {
+	Deployer  types.Address `json:"deployer"`
+	ProjectID string        `json:"project_id"` // Assuming you emit the backend project ID
+	// Add other relevant fields (e.g., NFT ID used for subscription)
+}
+
+type SuiEventListener struct {
+	rpcURL          string
+	contractAddress string // Package::Module of the emitting contract
+	eventObjectType string // Full Object Type string for the event filter, e.g., "0xPACKAGE::module::SiteDeployed"
+	walrusDeployer  *walrus.Deployer
+	sealClient      *seal.Client
+	neo4jService    *neo4j.Service
+	// Add Sui client/SDK instance here
+	suiClient *sui_json_rpc.SuiClient // Using go-sui example
+}
+
+func NewSuiEventListener(rpcURL, contractEventType string, deployer *walrus.Deployer, sealCli *seal.Client, neo4jSvc *neo4j.Service) *SuiEventListener {
+	// Initialize Sui client (using go-sui example)
+	suiClient, err := sui_json_rpc.NewSuiClient(rpcURL)
+	if err != nil {
+		log.Printf("WARN: Failed to initialize Sui client for event listener: %v. Listener inactive.", err)
+		// Return a struct that won't fatal, but log extensively or disable listening
+		return &SuiEventListener{ // Return partially initialized struct to avoid nil panics
+			rpcURL:          rpcURL,
+			eventObjectType: contractEventType,
+			walrusDeployer:  deployer,
+			sealClient:      sealCli,
+			neo4jService:    neo4jSvc,
+			suiClient:       nil, // Mark client as nil
+		}
+	}
+
+	return &SuiEventListener{
+		rpcURL:          rpcURL,
+		eventObjectType: contractEventType, // e.g., "0xPKG::module::SiteDeployed"
+		walrusDeployer:  deployer,
+		sealClient:      sealCli,
+		neo4jService:    neo4jSvc,
+		suiClient:       suiClient,
+	}
+}
+
+// StartListening polls or subscribes to Sui events.
+func (l *SuiEventListener) StartListening(ctx context.Context) error {
+	if l.suiClient == nil {
+		log.Println("Sui client not initialized, event listener is inactive.")
+		// Keep running but do nothing, or return an error to stop the app
+		<-ctx.Done() // Wait indefinitely until context is cancelled
+		return fmt.Errorf("Sui client not initialized")
+	}
+
+	log.Printf("Starting Sui event listener for type: %s", l.eventObjectType)
+
+	// Option 1: Subscription (Preferred if supported well by SDK/RPC)
+	// Requires WebSocket support on the RPC endpoint
+	// Example using go-sui (check its specific subscription API)
+	eventChan := make(chan *types.SuiEvent) // Use the correct event type from SDK
+	subTask, err := l.suiClient.SubscribeEvent(ctx, eventChan, types.SuiEventFilter{
+		/* Define filter, e.g., by Move Event Module + Struct Name */
+		// Example Filter (adjust based on go-sui or chosen SDK):
+		MoveEventType: l.eventObjectType, // Filter by the full event type string
+	})
+	if err != nil {
+		return fmt.Errorf("failed to subscribe to Sui events (%s): %w", l.eventObjectType, err)
+	}
+	log.Printf("Subscribed to Sui events: %s", l.eventObjectType)
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("Context cancelled, stopping event listener.")
+			subTask.Unsubscribe() // Clean up subscription
+			return ctx.Err()
+		case suiEvent := <-eventChan:
+			// Process the received event
+			l.processEvent(ctx, suiEvent)
+		case err := <-subTask.ErrChan: // Check for subscription errors
+			log.Printf("ERROR: Sui event subscription error: %v. Attempting to resubscribe...", err)
+			subTask.Unsubscribe() // Clean up old subscription
+			// Implement backoff and retry logic here
+			time.Sleep(5 * time.Second)
+			subTask, err = l.suiClient.SubscribeEvent(ctx, eventChan, types.SuiEventFilter{MoveEventType: l.eventObjectType})
+			if err != nil {
+				log.Printf("FATAL: Failed to resubscribe to Sui events after error: %v", err)
+				return fmt.Errorf("failed to resubscribe to Sui events: %w", err)
+			}
+			log.Println("Resubscribed to Sui events successfully.")
+
+		}
+	}
+
+	// Option 2: Polling (Fallback if subscription is unavailable/unreliable)
+	/*
+		ticker := time.NewTicker(10 * time.Second) // Poll every 10 seconds
+		defer ticker.Stop()
+		var lastCursor *types.EventId // Store cursor for next poll
+
+		for {
+			select {
+			case <-ctx.Done():
+				log.Println("Context cancelled, stopping event listener.")
+				return ctx.Err()
+			case <-ticker.C:
+				log.Println("Polling for new Sui events...")
+				// Use suiClient.GetEvents or QueryEvents with cursor
+				query := types.SuiEventFilter{ MoveEventType: l.eventObjectType }
+				events, err := l.suiClient.QueryEvents(ctx, query, lastCursor, 10, false) // Limit 10, descending = false
+				if err != nil {
+					log.Printf("Error polling Sui events: %v", err)
+					continue // Skip this poll cycle
+				}
+
+				if len(events.Data) > 0 {
+					log.Printf("Found %d new events.", len(events.Data))
+					for i := len(events.Data) - 1; i >= 0; i-- { // Process in chronological order
+						l.processEvent(ctx, &events.Data[i])
+					}
+					if events.HasNextPage && events.NextCursor != nil {
+					    lastCursor = events.NextCursor
+					}
+				} else {
+					log.Println("No new events found in this poll.")
+				}
+			}
+		}
+	*/
+}
+
+func (l *SuiEventListener) processEvent(ctx context.Context, event *types.SuiEvent) {
+	log.Printf("Received event: Type=%s, ID=%s, Timestamp=%d", event.Type, event.Id.String(), event.TimestampMs)
+
+	// Ensure the event type matches exactly what we expect for SiteDeployed
+	if event.Type != l.eventObjectType {
+		// This shouldn't happen if filter is correct, but good practice to check
+		log.Printf("Skipping event with unexpected type: %s", event.Type)
+		return
+	}
+
+	// The actual event data is often in `ParsedJson` or `MoveEvent` fields
+	// Using ParsedJson which is map[string]interface{} with go-sui
+	jsonData, err := json.Marshal(event.ParsedJson)
+	if err != nil {
+		log.Printf("ERROR: Failed to marshal event ParsedJson: %v", err)
+		return
+	}
+
+	// Attempt to unmarshal into our specific event struct
+	var siteDeployedEvent SiteDeployedEvent
+	err = json.Unmarshal(jsonData, &siteDeployedEvent)
+	if err != nil {
+		log.Printf("ERROR: Failed to unmarshal SiteDeployed event data: %v. Raw JSON: %s", err, string(jsonData))
+		return
+	}
+
+	// --- Handle SiteDeployed Event ---
+	log.Printf("Processing SiteDeployed event: Deployer=%s, ProjectID=%s", siteDeployedEvent.Deployer.String(), siteDeployedEvent.ProjectID)
+
+	// 1. Retrieve project files from Neo4j using ProjectID from event
+	files, err := l.neo4jService.GetProjectFiles(ctx, siteDeployedEvent.ProjectID)
+	if err != nil {
+		log.Printf("ERROR: Failed to retrieve files for project %s triggered by event: %v", siteDeployedEvent.ProjectID, err)
+		// How to handle? Retry? Log and drop? Depends on requirements.
+		return
+	}
+	if len(files) == 0 {
+		log.Printf("ERROR: No files found in Neo4j for project %s triggered by event. Skipping deployment.", siteDeployedEvent.ProjectID)
+		return
+	}
+
+	// 2. Trigger Walrus Deployment
+	cid, err := l.walrusDeployer.DeployFiles(ctx, files)
+	if err != nil {
+		log.Printf("ERROR: Failed to deploy project %s to Walrus triggered by event: %v", siteDeployedEvent.ProjectID, err)
+		// Potentially retry or mark project deployment as failed in Neo4j
+		return
+	}
+	log.Printf("Successfully deployed project %s triggered by event. CID: %s", siteDeployedEvent.ProjectID, cid)
+
+	// 3. Register Access Control with Seal
+	// Use the Deployer wallet address from the event for the policy
+	policyName := fmt.Sprintf("project-%s-access", siteDeployedEvent.ProjectID)
+	// Define NFT criteria based on your system's logic (e.g., ownership of the subscription NFT)
+	nftCriteria := map[string]interface{}{
+		// "contractAddress": "YOUR_SUBSCRIPTION_NFT_CONTRACT_ADDRESS",
+		// "network": "sui-" + l.suiNetwork, // Need network info here
+		"groupLogic":    "owner_of",                           // Placeholder logic
+		"nftIdentifier": "NFT_COLLECTION_IDENTIFIER_FOR_SEAL", // Replace with actual Seal config
+	}
+	err = l.sealClient.RegisterPolicy(ctx, policyName, cid, nftCriteria)
+	if err != nil {
+		log.Printf("ERROR: Failed to register Seal policy for CID %s triggered by event: %v", cid, err)
+		// Log error, deployment succeeded but access control failed.
+	} else {
+		log.Printf("Successfully registered Seal policy '%s' for CID %s triggered by event.", policyName, cid)
+	}
+
+	// 4. Update Neo4j Project node with the final CID
+	err = l.neo4jService.UpdateProjectCID(ctx, siteDeployedEvent.ProjectID, cid)
+	if err != nil {
+		log.Printf("WARN: Failed to update project %s with CID %s in Neo4j after event trigger: %v", siteDeployedEvent.ProjectID, cid, err)
+	}
+
+	// TODO: Handle SubscriptionCreatedEvent if needed (e.g., update internal state)
+	/*
+			case "YOUR_PACKAGE::module::SubscriptionCreated": // Use the actual event type string
+				var subCreatedEvent SubscriptionCreatedEvent
+				// Unmarshal event.ParsedJson or similar into subCreatedEvent
+				if err := json.Unmarshal(jsonData, &subCreatedEvent); err != nil {
+					 log.Printf("ERROR: Failed to unmarshal SubscriptionCreated event data: %v. Raw JSON: %s", err, string(jsonData))
+		             return
+				}
+				log.Printf("Processing SubscriptionCreated event: Subscriber=%s", subCreatedEvent.Subscriber.String())
+				// Update backend state if necessary
+	*/
+}

@@ -1,0 +1,252 @@
+package sui
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"strings"
+	"time"
+
+	// Using coming-chat/go-sui as the example SDK
+	"github.com/coming-chat/go-sui/v2/client" // For hex parsing
+	"github.com/coming-chat/go-sui/v2/sui_types"
+	"github.com/coming-chat/go-sui/v2/types"
+)
+
+// Service handles interactions with the Sui blockchain.
+type Service struct {
+	client            *client.Client      // Sui RPC Client instance
+	suinsContractAddr *sui_types.ObjectID // Parsed ObjectID of the SUINS registry
+	suinsNftType      string              // Full type string, e.g., 0xPKG::suins::Suins
+}
+
+// NewService initializes the Sui interaction service.
+func NewService(rpcURL, suinsContractHex, suinsNftType string) (*Service, error) {
+	if rpcURL == "" {
+		return nil, fmt.Errorf("Sui RPC endpoint URL cannot be empty")
+	}
+	log.Printf("Initializing Sui Service with RPC: %s", rpcURL)
+
+	// Initialize Sui client with default options (adjust timeouts etc. if needed)
+	cli, err := client.Dial(rpcURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to dial Sui RPC endpoint %s: %w", rpcURL, err)
+	}
+
+	// Validate and parse SUINS contract address (assuming it's the package ID or relevant object)
+	if suinsContractHex == "" {
+		log.Println("WARN: SUINS_CONTRACT_ADDRESS is not set. SUINS verification might fail if needed.")
+		// Allow initialization but log warning
+	}
+	var suinsAddr *sui_types.ObjectID
+	if suinsContractHex != "" {
+		suinsAddr, err = sui_types.NewAddressFromHex(suinsContractHex)
+		if err != nil {
+			return nil, fmt.Errorf("invalid SUINS contract address format '%s': %w", suinsContractHex, err)
+		}
+	}
+
+	// Basic validation of NFT type format
+	if suinsNftType == "" {
+		return nil, fmt.Errorf("SUINS_NFT_TYPE cannot be empty")
+	}
+	if !strings.Contains(suinsNftType, "::") || !strings.HasPrefix(suinsNftType, "0x") {
+		// Provide more specific guidance on the expected format
+		log.Printf("WARN: SUINS NFT Type '%s' might not be in the correct format (expected '0xPACKAGE::MODULE::STRUCT').", suinsNftType)
+	}
+
+	log.Printf("Sui Service initialized. SUINS Contract Addr: %v, SUINS NFT Type: %s", suinsAddr, suinsNftType)
+
+	return &Service{
+		client:            cli,
+		suinsContractAddr: suinsAddr, // May be nil if not provided
+		suinsNftType:      suinsNftType,
+	}, nil
+}
+
+// VerifySuinsOwnership checks if a given wallet address owns the SUINS NFT corresponding to the name.
+// **CRITICAL ASSUMPTION**: Assumes the SUINS NFT object (matching `suinsNftType`) has a field named `name`
+// in its `content.fields` or `display.fields` map that holds the normalized SUINS name string.
+// This logic MUST be adapted based on the actual SUINS contract implementation.
+func (s *Service) VerifySuinsOwnership(ctx context.Context, walletAddressHex, suinsName string) (bool, error) {
+	if s.client == nil {
+		return false, fmt.Errorf("Sui client is not initialized in Sui Service")
+	}
+
+	walletAddr, err := sui_types.NewAddressFromHex(walletAddressHex)
+	if err != nil {
+		return false, fmt.Errorf("invalid wallet address format '%s': %w", walletAddressHex, err)
+	}
+
+	// Normalize the target SUINS name for comparison
+	suinsNameLower := strings.ToLower(strings.TrimSuffix(suinsName, ".sui")) // Also trim .sui for comparison if names are stored without it
+
+	log.Printf("Verifying ownership of SUINS name '%s' (normalized: '%s') for wallet %s", suinsName, suinsNameLower, walletAddr.String())
+
+	// --- Query owned NFTs of the correct type ---
+	limit := uint(50) // Max objects per page (check API limits)
+	var cursor *types.SuiObjectResponseQueryCursor = nil
+	hasNextPage := true
+	foundMatchingNft := false
+	pageCount := 0
+
+	for hasNextPage {
+		pageCount++
+		log.Printf("Querying page %d of owned objects for wallet %s (Type: %s)", pageCount, walletAddr.String(), s.suinsNftType)
+
+		// Set options to retrieve necessary data for checking the name
+		options := types.SuiObjectDataOptions{
+			ShowType:    true,
+			ShowOwner:   true, // Good for sanity check, though we query by owner
+			ShowContent: true, // NEED content fields to check the name (Assumption!)
+			ShowDisplay: true, // NEED display fields as fallback (Assumption!)
+		}
+		query := types.SuiObjectResponseQuery{
+			Filter: &types.SuiObjectDataFilter{
+				StructType: s.suinsNftType, // Filter by the exact struct type
+			},
+			Options: &options,
+		}
+
+		// Add timeout to the RPC call context
+		rpcCtx, cancel := context.WithTimeout(ctx, 20*time.Second) // Increased timeout for potentially large queries
+
+		resp, err := s.client.GetOwnedObjects(rpcCtx, *walletAddr, &query, cursor, &limit)
+		cancel() // Release context resources promptly
+		if err != nil {
+			// Check for specific RPC errors if needed (e.g., rate limits)
+			return false, fmt.Errorf("failed to query owned objects (page %d) for wallet %s: %w", pageCount, walletAddr.String(), err)
+		}
+
+		log.Printf("Page %d: Received %d objects, HasNextPage: %v", pageCount, len(resp.Data), resp.HasNextPage)
+
+		// --- Check each returned NFT object ---
+		for _, objResp := range resp.Data {
+			if objResp.Error != nil {
+				log.Printf("Skipping object response due to error: %v", objResp.Error)
+				continue
+			}
+			if objResp.Data == nil {
+				log.Printf("Skipping object response due to missing Data field.")
+				continue
+			}
+			objData := objResp.Data
+			log.Printf("Checking NFT Object ID: %s", objData.ObjectId.ShortString())
+
+			// Function to extract and compare name from different possible locations
+			checkName := func() bool {
+				// 1. Check Content Fields (Most common for Move structs)
+				if objData.Content != nil && objData.Content.Data.Struct != nil {
+					fields := objData.Content.Data.Struct.Fields
+					if nameField, ok := fields["name"]; ok { // ASSUMPTION: field name is "name"
+						if nameStr, ok := nameField.(string); ok {
+							log.Printf("... Found content field 'name': '%s'", nameStr)
+							if strings.ToLower(nameStr) == suinsNameLower {
+								return true
+							}
+						} else {
+							log.Printf("... Content field 'name' is not a string (%T)", nameField)
+						}
+					}
+				} else if objData.Content != nil {
+					log.Printf("... Content type is not Struct: %s", objData.Content.DataType)
+				}
+
+				// 2. Check Display Fields (Alternative standard)
+				if objData.Display != nil && objData.Display.Data != nil {
+					if nameField, ok := objData.Display.Data["name"]; ok { // ASSUMPTION: display key is "name"
+						if nameStr, ok := nameField.(string); ok {
+							log.Printf("... Found display field 'name': '%s'", nameStr)
+							if strings.ToLower(nameStr) == suinsNameLower {
+								return true
+							}
+						} else {
+							log.Printf("... Display field 'name' is not a string (%T)", nameField)
+						}
+					}
+				}
+				// Add more checks here if necessary (e.g., different field names, dynamic fields)
+				// else if objData.Content != nil && objData.Content.Data.Struct != nil {
+				//     if domainField, ok := objData.Content.Data.Struct.Fields["domain_name"]; ok { ... }
+				// }
+				return false
+			}
+
+			if checkName() {
+				log.Printf("Found matching SUINS NFT: ID %s for name '%s'", objData.ObjectId.ShortString(), suinsName)
+				foundMatchingNft = true
+				break // Exit the inner loop over objects on this page
+			}
+		} // End loop over objects on page
+
+		if foundMatchingNft {
+			break // Exit the outer pagination loop if found
+		}
+
+		// Prepare for the next page
+		hasNextPage = resp.HasNextPage
+		if hasNextPage {
+			cursor = resp.NextCursor
+			if cursor == nil {
+				log.Printf("WARN: HasNextPage is true but NextCursor is nil. Stopping pagination.")
+				hasNextPage = false // Prevent infinite loop
+			}
+		}
+	} // End pagination loop
+
+	// Final result
+	if foundMatchingNft {
+		log.Printf("Ownership confirmed: Wallet %s owns SUINS NFT for '%s'", walletAddr.String(), suinsName)
+		return true, nil
+	}
+
+	log.Printf("Ownership verification failed: Wallet %s does not appear to own the SUINS NFT for '%s' (checked %d pages)", walletAddr.String(), suinsName, pageCount)
+	return false, nil
+}
+
+// CheckNFTOwnership is a placeholder for general NFT ownership checks (e.g., for subscriptions)
+// You would implement this similarly to VerifySuinsOwnership but using the appropriate NFT type
+// and potentially just checking for the *presence* of any NFT of that type, not a specific field value.
+func (s *Service) CheckNFTOwnership(ctx context.Context, walletAddressHex, requiredNftType string) (bool, error) {
+	if s.client == nil {
+		return false, fmt.Errorf("Sui client is not initialized in Sui Service")
+	}
+
+	walletAddr, err := sui_types.NewAddressFromHex(walletAddressHex)
+	if err != nil {
+		return false, fmt.Errorf("invalid wallet address format '%s': %w", walletAddressHex, err)
+	}
+
+	log.Printf("Checking if wallet %s owns any NFT of type '%s'", walletAddr.String(), requiredNftType)
+
+	limit := uint(1) // We only need to find one
+	filter := types.SuiObjectDataFilter{StructType: requiredNftType}
+	options := types.SuiObjectDataOptions{ShowType: true} // Don't need content/display here
+
+	rpcCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	resp, err := s.client.GetOwnedObjects(rpcCtx, *walletAddr, &types.SuiObjectResponseQuery{
+		Filter:  &filter,
+		Options: &options,
+	}, nil, &limit) // No cursor needed, just check first page with limit 1
+	if err != nil {
+		return false, fmt.Errorf("failed to query owned NFTs (type: %s) for wallet %s: %w", requiredNftType, walletAddr.String(), err)
+	}
+
+	// If the response contains at least one object, the wallet owns it.
+	ownsNft := len(resp.Data) > 0
+	if ownsNft {
+		log.Printf("Wallet %s confirmed to own at least one NFT of type '%s'", walletAddr.String(), requiredNftType)
+	} else {
+		log.Printf("Wallet %s does not own any NFT of type '%s'", walletAddr.String(), requiredNftType)
+	}
+
+	return ownsNft, nil
+}
+
+// Helper to check address format (basic)
+func isValidSuiAddress(addr string) bool {
+	return strings.HasPrefix(addr, "0x") && len(addr) == 66 // Sui addresses are 32 bytes + 0x prefix
+	// Could add more robust validation using SDK parsing if needed
+}

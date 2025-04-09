@@ -7,7 +7,7 @@ import (
 	"net/http"
 
 	// "strings"          // Import strings
-	"sui_ai_server/ai" // Import ai package
+	"sui_ai_server/internal/ai" // Import ai package
 	// "sui_ai_server/db/neo4j"
 	// "sui_ai_server/rag"
 	// "sui_ai_server/sui" // NEW: Import sui interaction package

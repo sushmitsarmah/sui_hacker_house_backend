@@ -1,0 +1,595 @@
+package neo4j
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"strings" // Import strings
+	"time"    // Import time
+
+	"github.com/google/uuid"
+	"github.com/neo4j/neo4j-go-driver/v5/neo4j"
+	"github.com/neo4j/neo4j-go-driver/v5/neo4j/db" // For specific error types like Neo4jError
+)
+
+var ErrProjectNotFound = errors.New("project not found")
+var ErrFileNotFound = errors.New("file not found")
+var ErrSuinsNameTaken = errors.New("SUINS name is already mapped to another project")
+var ErrSuinsMappingNotFound = errors.New("no project found mapped to this SUINS name")
+
+// Define constants for node labels and relationship types
+const (
+	ProjectLabel     = "Project"
+	FileLabel        = "File"
+	EmbeddingLabel   = "Embedding"
+	HasFileRel       = "HAS_FILE"
+	HasEmbeddingRel  = "HAS_EMBEDDING"
+	VectorIndexName  = "fileContentEmbeddings" // Name for the vector index
+	EmbeddingDim     = 1536                    // Dimension for text-embedding-ada-002, adjust if using different model
+	SuinsNameIndex   = "projectSuinsName"      // Index for faster SUINS lookup
+)
+
+type Service struct {
+	driver neo4j.DriverWithContext
+}
+
+func NewService(driver neo4j.DriverWithContext) *Service {
+	return &Service{driver: driver}
+}
+
+// SetupIndexes creates necessary indexes (Vector and SUINS Name). Call on startup.
+func (s *Service) SetupIndexes(ctx context.Context) error {
+	var firstErr error
+	err := s.createVectorIndex(ctx)
+	if err != nil {
+		// Log error but continue trying to create other indexes
+		log.Printf("Error creating vector index: %v", err)
+		firstErr = err // Store the first error encountered
+	}
+	err = s.createSuinsNameIndex(ctx)
+	if err != nil {
+		log.Printf("Error creating SUINS name index: %v", err)
+		if firstErr == nil { // Store this error if it's the first one
+			firstErr = err
+		}
+	}
+	// Return the first error encountered, or nil if both succeed
+	return firstErr
+}
+
+// createVectorIndex ensures the vector index exists for file embeddings.
+func (s *Service) createVectorIndex(ctx context.Context) error {
+	session := s.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
+	defer session.Close(ctx)
+
+	// Use CREATE ... IF NOT EXISTS which is idempotent
+	createQuery := fmt.Sprintf(`
+        CREATE VECTOR INDEX %s IF NOT EXISTS
+        FOR (e:%s) ON (e.vector)
+        OPTIONS { indexConfig: {
+            \`vector.dimensions\`: %d,
+            \`vector.similarity_function\`: 'cosine'
+        }}`, VectorIndexName, EmbeddingLabel, EmbeddingDim)
+
+	_, err := session.ExecuteWrite(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
+		_, err := tx.Run(ctx, createQuery, nil)
+		// We don't need to check the result of the query itself here,
+		// as errors during execution are returned by ExecuteWrite.
+		return nil, err
+	})
+
+	if err != nil {
+		// Log the specific Neo4j error if available
+		var neoErr *db.Neo4jError
+		if errors.As(err, &neoErr) {
+			log.Printf("Neo4j Error during vector index creation: Code=%s, Message=%s", neoErr.Code, neoErr.Msg)
+			// Check if the error is specifically about the index already existing (though IF NOT EXISTS should prevent this)
+			if strings.Contains(neoErr.Code, "Schema.EquivalentSchemaRuleAlreadyExists") || strings.Contains(neoErr.Msg, "already exists") {
+				log.Printf("Vector index '%s' already exists (confirmed by CREATE IF NOT EXISTS behavior).", VectorIndexName)
+				return nil // Not an error in this case
+			}
+		}
+		// Return any other error
+		return fmt.Errorf("failed to create vector index '%s': %w", VectorIndexName, err)
+	}
+
+	log.Printf("Successfully created or ensured vector index '%s' exists.", VectorIndexName)
+	return nil
+}
+
+// createSuinsNameIndex ensures the index on Project.suinsName exists.
+func (s *Service) createSuinsNameIndex(ctx context.Context) error {
+	session := s.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
+	defer session.Close(ctx)
+
+	// If suinsName should be unique across all projects:
+	// createQuery := fmt.Sprintf(`
+	//  CREATE CONSTRAINT %s IF NOT EXISTS
+	//  FOR (p:%s) REQUIRE p.suinsName IS UNIQUE`, SuinsNameIndex, ProjectLabel)
+
+	// If suinsName just needs an index for lookup speed:
+	createQuery := fmt.Sprintf(`
+     CREATE INDEX %s IF NOT EXISTS
+     FOR (p:%s) ON (p.suinsName)`, SuinsNameIndex, ProjectLabel)
+
+	_, err := session.ExecuteWrite(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
+		_, err := tx.Run(ctx, createQuery, nil)
+		return nil, err
+	})
+
+	if err != nil {
+		var neoErr *db.Neo4jError
+		if errors.As(err, &neoErr) {
+			log.Printf("Neo4j Error during SUINS name index/constraint creation: Code=%s, Message=%s", neoErr.Code, neoErr.Msg)
+			// Check if it already exists
+			if strings.Contains(neoErr.Code, "Schema.EquivalentSchemaRuleAlreadyExists") || strings.Contains(neoErr.Msg, "already exists") {
+				log.Printf("Index/Constraint '%s' already exists.", SuinsNameIndex)
+				return nil // Not an error if already exists
+			}
+		}
+		return fmt.Errorf("failed to create SUINS name index/constraint '%s': %w", SuinsNameIndex, err)
+	}
+
+	log.Printf("Successfully created or ensured SUINS name index/constraint '%s' exists.", SuinsNameIndex)
+	return nil
+}
+
+// CreateProject creates a new Project node. Initialize suinsName as null.
+func (s *Service) CreateProject(ctx context.Context, id, wallet, prompt string) error {
+	session := s.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
+	defer session.Close(ctx)
+
+	_, err := session.ExecuteWrite(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
+		query := fmt.Sprintf(`
+            CREATE (p:%s {
+                id: $id,
+                wallet: $wallet,
+                prompt: $prompt,
+                createdAt: datetime(),
+                cid: null,
+                suinsName: null
+            })`, ProjectLabel)
+		_, err := tx.Run(ctx, query, map[string]any{
+			"id":     id,
+			"wallet": wallet,
+			"prompt": prompt,
+		})
+		return nil, err
+	})
+	if err != nil {
+		return fmt.Errorf("failed to execute CreateProject transaction: %w", err)
+	}
+	return nil
+}
+
+// CreateFile creates a new File node and links it to a Project. Returns file node's internal ID.
+func (s *Service) CreateFile(ctx context.Context, projectID, name, content, fileType string) (string, error) {
+	session := s.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
+	defer session.Close(ctx)
+
+	fileID := uuid.New().String() // Use a separate UUID for internal file ID
+
+	result, err := session.ExecuteWrite(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
+		query := fmt.Sprintf(`
+            MATCH (p:%s {id: $projectID})
+            CREATE (f:%s {
+                id: $fileID,
+                name: $name,
+                content: $content,
+                type: $fileType,
+                createdAt: datetime()
+            })
+            CREATE (p)-[:%s]->(f)
+            RETURN f.id AS createdFileId`, ProjectLabel, FileLabel, HasFileRel)
+
+		res, err := tx.Run(ctx, query, map[string]any{
+			"projectID": projectID,
+			"fileID":    fileID,
+			"name":      name,
+			"content":   content,
+			"type":      fileType,
+		})
+		if err != nil {
+			return nil, err // Error running the query
+		}
+		// Use Single to ensure the relationship was created and get the ID
+		record, err := res.Single(ctx)
+		if err != nil {
+			// Single() errors if MATCH fails (0 results) or if >1 result unexpectedly
+			return nil, err
+		}
+		// Return the created file ID from the record
+		return record.Get("createdFileId")
+	})
+
+	if err != nil {
+		// Check if the error suggests the Project node wasn't found
+		if strings.Contains(err.Error(), "no records") || strings.Contains(err.Error(), "failed to obtain result") {
+			// Could perform an explicit check here, but often the MATCH failure is indicative
+			return "", ErrProjectNotFound
+		}
+		// Otherwise, return the generic transaction error
+		return "", fmt.Errorf("neo4j transaction error creating file: %w", err)
+	}
+
+	// Type assert the result to string
+	createdID, ok := result.(string)
+	if !ok {
+		return "", fmt.Errorf("unexpected result type from CreateFile transaction: %T", result)
+	}
+
+	return createdID, nil
+}
+
+// CreateEmbedding creates an Embedding node and links it to a File.
+func (s *Service) CreateEmbedding(ctx context.Context, fileID string, vector []float32) error {
+	if len(vector) == 0 {
+		log.Printf("Skipping embedding creation for file %s as vector is empty.", fileID)
+		return nil // Not an error, just nothing to store
+	}
+
+	session := s.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
+	defer session.Close(ctx)
+
+	_, err := session.ExecuteWrite(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
+		query := fmt.Sprintf(`
+            MATCH (f:%s {id: $fileID})
+            CREATE (e:%s {
+                vector: $vector,
+                createdAt: datetime()
+            })
+            CREATE (f)-[:%s]->(e)
+            RETURN e.id`, FileLabel, EmbeddingLabel, HasEmbeddingRel) // Return ID to confirm creation
+
+		result, err := tx.Run(ctx, query, map[string]any{
+			"fileID": fileID,
+			"vector": vector,
+		})
+		if err != nil {
+			return nil, err
+		}
+		// Check if node was found and relationship created by verifying a result was returned
+		_, err = result.Single(ctx)
+		return nil, err
+	})
+
+	if err != nil {
+		// Check if the error suggests the File node wasn't found
+		if strings.Contains(err.Error(), "no records") || strings.Contains(err.Error(), "failed to obtain result") {
+			return ErrFileNotFound
+		}
+		return fmt.Errorf("neo4j transaction error creating embedding: %w", err)
+	}
+
+	return nil
+}
+
+// GetProjectFiles retrieves all files (name and content) for a given project ID.
+func (s *Service) GetProjectFiles(ctx context.Context, projectID string) (map[string]string, error) {
+	session := s.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeRead})
+	defer session.Close(ctx)
+
+	files := make(map[string]string)
+
+	result, err := session.ExecuteRead(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
+		query := fmt.Sprintf(`
+            MATCH (p:%s {id: $projectID})-[:%s]->(f:%s)
+            RETURN f.name AS name, f.content AS content`, ProjectLabel, HasFileRel, FileLabel)
+
+		res, err := tx.Run(ctx, query, map[string]any{"projectID": projectID})
+		if err != nil {
+			return nil, err
+		}
+		// Collect all records
+		return res.Collect(ctx)
+	})
+
+	// Check for general transaction errors first
+	if err != nil {
+		return nil, fmt.Errorf("failed to get project files query from neo4j: %w", err)
+	}
+
+	// Process the collected records
+	records := result.([]*neo4j.Record)
+	if len(records) == 0 {
+		// If no files found, check if the project node actually exists
+		exists, checkErr := s.checkProjectExistsRead(ctx, projectID)
+		if checkErr != nil {
+			// If the check itself failed, return that error
+			return nil, fmt.Errorf("failed to verify project existence after finding no files: %w", checkErr)
+		}
+		if !exists {
+			// If the project genuinely doesn't exist, return ProjectNotFound
+			return nil, ErrProjectNotFound
+		}
+		// Project exists but has no files, return the empty map
+		log.Printf("Project %s exists but has no associated files.", projectID)
+	}
+
+	// Populate the map from records
+	for _, record := range records {
+		nameVal, nameOk := record.Get("name")
+		contentVal, contentOk := record.Get("content")
+		if nameOk && contentOk {
+			files[nameVal.(string)] = contentVal.(string)
+		} else {
+			log.Printf("WARN: Skipping record during GetProjectFiles due to missing name or content.")
+		}
+	}
+
+	return files, nil
+}
+
+// UpdateProjectCID updates the CID field of a Project node.
+func (s *Service) UpdateProjectCID(ctx context.Context, projectID, cid string) error {
+	session := s.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
+	defer session.Close(ctx)
+
+	_, err := session.ExecuteWrite(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
+		query := fmt.Sprintf(`
+            MATCH (p:%s {id: $projectID})
+            SET p.cid = $cid
+            RETURN p.id`, ProjectLabel) // Return ID to confirm update occurred
+		result, err := tx.Run(ctx, query, map[string]any{
+			"projectID": projectID,
+			"cid":       cid,
+		})
+		if err != nil {
+			return nil, err
+		}
+		// Verify the node was found and updated by checking Single()
+		_, err = result.Single(ctx)
+		return nil, err
+	})
+
+	if err != nil {
+		// Check if the MATCH failed
+		if strings.Contains(err.Error(), "no records") || strings.Contains(err.Error(), "failed to obtain result") {
+			return ErrProjectNotFound
+		}
+		return fmt.Errorf("failed to update project CID in neo4j: %w", err)
+	}
+	return nil
+}
+
+// FindSimilarFiles retrieves files within a specific project relevant to the query vector.
+func (s *Service) FindSimilarFiles(ctx context.Context, projectID string, queryVector []float32, topK int) ([]neo4j.Node, error) {
+	session := s.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeRead})
+	defer session.Close(ctx)
+
+	result, err := session.ExecuteRead(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
+		// Match the project first to scope the search
+		// Then find files, their embeddings, and use the vector index for similarity search
+		query := fmt.Sprintf(`
+            MATCH (proj:%s {id: $projectID})-[:%s]->(f:%s)-[:%s]->(e:%s)
+            CALL db.index.vector.queryNodes($indexName, $topK, $queryVector) YIELD node AS embeddingNode, score
+            // Ensure the embedding found belongs to the file we matched earlier
+            WHERE e = embeddingNode
+            // Return the File node and the similarity score
+            RETURN f, score
+            ORDER BY score DESC
+            LIMIT $topK`, ProjectLabel, HasFileRel, FileLabel, HasEmbeddingRel, EmbeddingLabel)
+
+		res, err := tx.Run(ctx, query, map[string]any{
+			"projectID":   projectID,
+			"indexName":   VectorIndexName,
+			"topK":        topK,
+			"queryVector": queryVector,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return res.Collect(ctx)
+	})
+
+	if err != nil {
+		// A failure here could be due to the project not existing or other query issues.
+		// Check project existence explicitly if an error occurs to differentiate.
+		exists, checkErr := s.checkProjectExistsRead(ctx, projectID)
+		if checkErr == nil && !exists {
+			return nil, ErrProjectNotFound // Project not found is the root cause
+		}
+		// Otherwise, return the original query error
+		return nil, fmt.Errorf("failed to execute vector similarity search: %w", err)
+	}
+
+	// Process results
+	records := result.([]*neo4j.Record)
+	fileNodes := []neo4j.Node{}
+
+	// If no records were found, explicitly check if the project exists to return the correct status
+	if len(records) == 0 {
+		exists, checkErr := s.checkProjectExistsRead(ctx, projectID)
+		if checkErr != nil {
+			log.Printf("Error checking project existence during empty similarity search: %v", checkErr)
+			// Fall through and return empty list, but log the check error
+		} else if !exists {
+			return nil, ErrProjectNotFound
+		}
+		// Project exists, but no similar files found
+		log.Printf("No similar files found for project %s matching the query vector.", projectID)
+	}
+
+	for _, record := range records {
+		fileNodeInterface, fileOk := record.Get("f")
+		scoreInterface, scoreOk := record.Get("score")
+
+		if fileOk && scoreOk {
+			if fileNode, ok := fileNodeInterface.(neo4j.Node); ok {
+				fileNodes = append(fileNodes, fileNode)
+				if score, ok := scoreInterface.(float64); ok {
+					log.Printf("Found relevant file (NodeID: %d, Name: %v) with score: %f", fileNode.Id, fileNode.Props["name"], score)
+				}
+			}
+		} else {
+			log.Printf("WARN: Skipping record in FindSimilarFiles due to missing 'f' or 'score'.")
+		}
+	}
+
+	return fileNodes, nil
+}
+
+// --- SUINS Mapping Functions ---
+
+// MapSuinsNameToProject adds or updates the suinsName property on a Project node.
+// It ensures the name isn't already taken by another project.
+func (s *Service) MapSuinsNameToProject(ctx context.Context, projectID, suinsName string) error {
+	session := s.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
+	defer session.Close(ctx)
+
+	_, err := session.ExecuteWrite(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
+		// Transaction steps:
+		// 1. Check if suinsName is used by another project.
+		// 2. If not, update the target project.
+
+		// Step 1: Check for conflict
+		checkQuery := fmt.Sprintf(`
+            MATCH (existing:%s {suinsName: $suinsName})
+            WHERE existing.id <> $projectID
+            RETURN existing.id AS conflictingProjectID`, ProjectLabel)
+		checkResult, err := tx.Run(ctx, checkQuery, map[string]any{
+			"suinsName": suinsName,
+			"projectID": projectID,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to run SUINS name conflict check query: %w", err)
+		}
+
+		// Check if any conflicting record was found
+		conflictingRecord, err := checkResult.Single(ctx)
+		// Single() returns error if 0 or >1 records. Error is expected if name is available.
+		if err == nil && conflictingRecord != nil {
+			// A record was found, meaning the name is taken
+			conflictingID, _ := conflictingRecord.Get("conflictingProjectID")
+			log.Printf("SUINS name '%s' is already taken by project '%s'", suinsName, conflictingID.(string))
+			return nil, ErrSuinsNameTaken
+		}
+		// If error is not nil, check if it's the expected "no records" error
+		if err != nil && !(strings.Contains(err.Error(), "no records") || strings.Contains(err.Error(), "available after consuming the result")) {
+			// An unexpected error occurred during the conflict check
+			return nil, fmt.Errorf("unexpected error checking SUINS name conflict: %w", err)
+		}
+		// If we reach here, the name is available (either 0 records found, or expected error occurred)
+
+		// Step 2: Update the target project
+		updateQuery := fmt.Sprintf(`
+            MATCH (p:%s {id: $projectID})
+            SET p.suinsName = $suinsName
+            RETURN p.id AS updatedProjectID`, ProjectLabel)
+		updateResult, err := tx.Run(ctx, updateQuery, map[string]any{
+			"projectID": projectID,
+			"suinsName": suinsName,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to run SUINS name update query: %w", err)
+		}
+
+		// Verify the project was found and updated by ensuring Single() succeeds
+		_, err = updateResult.Single(ctx)
+		if err != nil {
+			// Check if the target project itself didn't exist
+			if strings.Contains(err.Error(), "no records") || strings.Contains(err.Error(), "available after consuming the result") {
+				return nil, ErrProjectNotFound // Target project not found
+			}
+			// Otherwise, it's an unexpected error confirming the update
+			return nil, fmt.Errorf("failed to confirm SUINS name update: %w", err)
+		}
+
+		return nil, nil // Transaction successful
+	})
+
+	// Return any error bubbled up from the transaction execution
+	return err
+}
+
+// GetProjectBySuinsName finds a project ID and CID based on its mapped SUINS name.
+func (s *Service) GetProjectBySuinsName(ctx context.Context, suinsName string) (projectID, cid string, err error) {
+	session := s.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeRead})
+	defer session.Close(ctx)
+
+	result, err := session.ExecuteRead(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
+		query := fmt.Sprintf(`
+            MATCH (p:%s {suinsName: $suinsName})
+            RETURN p.id AS projectID, p.cid AS cid
+            LIMIT 1`, ProjectLabel) // Limit 1 for safety, though index/constraint should handle uniqueness
+		res, err := tx.Run(ctx, query, map[string]any{"suinsName": suinsName})
+		if err != nil {
+			return nil, err
+		}
+		// Use Single to expect exactly one or zero results
+		return res.Single(ctx)
+	})
+
+	if err != nil {
+		// Check if the specific error means the SUINS name wasn't found
+		if strings.Contains(err.Error(), "no records") || strings.Contains(err.Error(), "available after consuming the result") {
+			return "", "", ErrSuinsMappingNotFound
+		}
+		// Otherwise, it's some other DB error
+		return "", "", fmt.Errorf("failed to query project by SUINS name: %w", err)
+	}
+
+	// Process the found record
+	record := result.(*neo4j.Record)
+	idVal, idOk := record.Get("projectID")
+	cidVal, cidOk := record.Get("cid") // CID might be null if not deployed yet
+
+	if !idOk {
+		// This shouldn't happen if the query returned a record, indicates schema issue
+		return "", "", fmt.Errorf("internal error: project ID not found in SUINS lookup result")
+	}
+
+	projectID = idVal.(string)
+
+	// Handle potentially null CID
+	if cidOk && cidVal != nil {
+		if cidStr, ok := cidVal.(string); ok {
+			cid = cidStr
+		} else {
+			log.Printf("WARN: CID property for project %s (SUINS: %s) is not a string: %T", projectID, suinsName, cidVal)
+			cid = "" // Treat non-string CID as empty
+		}
+	} else {
+		cid = "" // Explicitly set to empty string if null or property missing
+	}
+
+	return projectID, cid, nil
+}
+
+// --- Helper Functions ---
+
+// checkProjectExistsRead checks if a project exists using a read transaction
+func (s *Service) checkProjectExistsRead(ctx context.Context, projectID string) (bool, error) {
+	session := s.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeRead})
+	defer session.Close(ctx)
+
+	result, err := session.ExecuteRead(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
+		query := fmt.Sprintf("MATCH (p:%s {id: $projectID}) RETURN count(p) > 0 AS exists", ProjectLabel)
+		res, err := tx.Run(ctx, query, map[string]any{"projectID": projectID})
+		if err != nil {
+			return false, err
+		}
+		record, err := res.Single(ctx)
+		// Single() should always return one record for a count query. If it errors, something is wrong.
+		if err != nil {
+			return false, err // Report DB error
+		}
+		existsVal, ok := record.Get("exists")
+		if !ok {
+			return false, fmt.Errorf("exists flag not found in count query result")
+		}
+		return existsVal.(bool), nil
+	})
+
+	if err != nil {
+		return false, fmt.Errorf("failed transaction for checking project existence: %w", err)
+	}
+
+	// Type assert the final result
+	exists, ok := result.(bool)
+	if !ok {
+		return false, fmt.Errorf("unexpected result type from checkProjectExistsRead: %T", result)
+	}
+	return exists, nil
+}

@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
-	"path/filepath" // Added for determineFileType
+	"log" // Added for determineFileType
 	"strings"
+
+	"sui_ai_server/internal/ai/prompts"
+	"sui_ai_server/internal/utils"
 
 	// "sui_ai_server/db/neo4j"
 	"time" // Added for potential retries or delays
@@ -47,58 +49,12 @@ func NewGenerator(apiKey string, embeddingModel string) *Generator {
 	}
 }
 
-// Constant for the initial generation prompt template
-const initialGenerationPromptTemplate = `You are a full-stack site generator AI.
-
-A user has submitted the following project description:
-
----
-"%s"
----
-
-Please create a **multi-file project** based on the following rules:
-
-1.  **Frontend Framework**: React + TypeScript (Vite)
-2.  **Styling**: TailwindCSS, consistent color theme:
-    *   Primary: #1A73E8
-    *   Accent: #FF6F61
-    *   Background: #F9FAFB
-    *   Font: Inter, sans-serif
-3.  **Layout**: Responsive grid, cards with soft shadows and rounded corners
-4.  **Animations**: Use Framer Motion for subtle entry effects on buttons, cards, and modals
-5.  **Pages to Include** (at minimum):
-    *   ` + "`index.tsx`" + `: landing page with hero section, feature highlights
-    *   ` + "`about.tsx`" + `: about the site/project
-    *   ` + "`components/Navbar.tsx`" + `, ` + "`Footer.tsx`" + `
-    *   ` + "`App.tsx`" + `: wrap routes and layout
-    *   ` + "`main.tsx`" + `: app root
-    *   ` + "`tailwind.config.ts`" + `: theme customization
-    *   ` + "`vite.config.ts`" + `: default Vite config
-
-Respond with a structured array of files in the following format:
-
-` + "```json" + `
-[
-  {
-    "filename": "src/App.tsx",
-    "type": "tsx",
-    "content": "..."
-  },
-  {
-    "filename": "src/components/Navbar.tsx",
-    "type": "tsx",
-    "content": "..."
-  },
-  ...
-]
-` + "```" + `
-
-Only include code — no extra explanation. Your output will be parsed and saved as project files.`
-
 // GenerateSiteAndStore generates the site, stores it in Neo4j, and returns the project ID.
 func (g *Generator) GenerateSiteAndStore(ctx context.Context, userPrompt, walletAddress string) (string, error) {
 	projectID := uuid.New().String()
 	log.Printf("Generating site for project %s, wallet %s", projectID, walletAddress)
+
+	initialGenerationPromptTemplate := prompts.GetSiteGenerationPrompt()
 
 	// 1. Construct the prompt using the template
 	fullPrompt := fmt.Sprintf(initialGenerationPromptTemplate, userPrompt)
@@ -123,7 +79,7 @@ func (g *Generator) GenerateSiteAndStore(ctx context.Context, userPrompt, wallet
 	)
 
 	// Basic retry logic example
-	if err != nil && shouldRetry(err) {
+	if err != nil && utils.ShouldRetry(err) {
 		log.Printf("OpenAI call failed, retrying once after delay... Error: %v", err)
 		time.Sleep(2 * time.Second)
 		// Recreate the request struct for clarity in retry
@@ -306,7 +262,7 @@ func (g *Generator) GenerateEmbedding(ctx context.Context, text string) ([]float
 
 	resp, err := g.client.CreateEmbeddings(ctx, req)
 	// Add retry logic here too if needed
-	if err != nil && shouldRetry(err) {
+	if err != nil && utils.ShouldRetry(err) {
 		log.Printf("OpenAI embedding failed, retrying... Error: %v", err)
 		time.Sleep(1 * time.Second)
 		resp, err = g.client.CreateEmbeddings(ctx, req)
@@ -321,70 +277,6 @@ func (g *Generator) GenerateEmbedding(ctx context.Context, text string) ([]float
 	}
 
 	return resp.Data[0].Embedding, nil
-}
-
-// determineFileType provides a fallback if the LLM doesn't specify a type.
-func (g *Generator) determineFileType(filename string) string {
-	lowerFilename := strings.ToLower(filename)
-	ext := filepath.Ext(lowerFilename)
-	switch ext {
-	case ".html":
-		return "HTML"
-	case ".css":
-		return "CSS"
-	case ".js":
-		return "JavaScript"
-	case ".jsx":
-		return "JSX"
-	case ".ts":
-		return "TypeScript"
-	case ".tsx":
-		return "TSX"
-	case ".json":
-		return "JSON"
-	case ".md":
-		return "Markdown"
-	case ".txt":
-		return "Text"
-	case ".yaml", ".yml":
-		return "YAML"
-	case ".toml":
-		return "TOML"
-	case ".sh":
-		return "Shell"
-	case ".py":
-		return "Python"
-	case ".go":
-		return "Go"
-	case ".env":
-		return "Env"
-	case ".gitignore":
-		return "GitIgnore"
-	case ".svg":
-		return "SVG"
-	case ".png", ".jpg", ".jpeg", ".gif", ".webp":
-		return "Image" // May not want embeddings for images
-	default:
-		// Try getting type from common config file names
-		base := filepath.Base(lowerFilename)
-		if strings.Contains(base, "dockerfile") {
-			return "Dockerfile"
-		}
-		if strings.Contains(base, "vite.config") {
-			return "Config"
-		} // Generic config
-		if strings.Contains(base, "tailwind.config") {
-			return "Config"
-		}
-		if strings.Contains(base, "package.json") {
-			return "JSON"
-		}
-		if strings.Contains(base, "tsconfig.json") {
-			return "JSON"
-		}
-
-		return "Unknown"
-	}
 }
 
 // GenerateWithContext is useful for pure Q&A RAG where the answer is text.
@@ -404,7 +296,7 @@ func (g *Generator) GenerateWithContext(ctx context.Context, systemPrompt string
 		},
 	)
 
-	if err != nil && shouldRetry(err) {
+	if err != nil && utils.ShouldRetry(err) {
 		log.Printf("OpenAI text generation with context failed, retrying... Error: %v", err)
 		time.Sleep(1 * time.Second)
 		// resp, err = g.client.CreateChatCompletion(ctx)
@@ -471,7 +363,7 @@ Only return the modified or newly added files. Do not include duplicates or file
 
 	resp, err := g.client.CreateChatCompletion(ctx, req)
 
-	if err != nil && shouldRetry(err) {
+	if err != nil && utils.ShouldRetry(err) {
 		log.Printf("OpenAI call for code changes failed, retrying... Error: %v", err)
 		time.Sleep(2 * time.Second)
 		resp, err = g.client.CreateChatCompletion(ctx, req)
@@ -523,31 +415,4 @@ Only return the modified or newly added files. Do not include duplicates or file
 	log.Printf("LLM suggested %d file changes/additions.", len(changedFiles))
 
 	return changedFiles, nil
-}
-
-// Simple retry check (customize as needed)
-func shouldRetry(err error) bool {
-	if err == nil {
-		return false
-	}
-	// Example: Retry on specific transient errors like rate limits or server errors
-	errMsg := strings.ToLower(err.Error())
-	if strings.Contains(errMsg, "rate limit") ||
-		strings.Contains(errMsg, "500 internal server error") ||
-		strings.Contains(errMsg, "502 bad gateway") ||
-		strings.Contains(errMsg, "503 service unavailable") ||
-		strings.Contains(errMsg, "504 gateway timeout") ||
-		strings.Contains(errMsg, "timeout") ||
-		strings.Contains(errMsg, "connection reset by peer") ||
-		strings.Contains(errMsg, "context deadline exceeded") { // Context deadline might indicate temporary overload
-		return true
-	}
-	// Check for specific OpenAI error types if available in the client library
-	// var openAIErr *openai.APIError
-	// if errors.As(err, &openAIErr) {
-	//     if openAIErr.HTTPStatusCode >= 500 || openAIErr.HTTPStatusCode == 429 {
-	//         return true
-	//     }
-	// }
-	return false
 }

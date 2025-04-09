@@ -1,0 +1,177 @@
+package rag
+
+import (
+	"context"
+	"errors" // Import errors package
+	"fmt"
+	"log"
+	"strings"
+	"sui_ai_server/ai" // Import ai package to use GeneratedFile struct and Generator methods
+	"sui_ai_server/db/neo4j"
+)
+
+type RAGService struct {
+	neo4jService     *neo4j.Service
+	aiGenerator      *ai.Generator // Used for embeddings and final answer generation
+	embeddingModelID string
+}
+
+func NewRAGService(neo4jSvc *neo4j.Service, aiGen *ai.Generator, embeddingModel string) *RAGService {
+	return &RAGService{
+		neo4jService:     neo4jSvc,
+		aiGenerator:      aiGen,
+		embeddingModelID: embeddingModel,
+	}
+}
+
+// QueryProject: Generates *textual* answers based on RAG context.
+func (r *RAGService) QueryProject(ctx context.Context, projectID, userQuery string) (string, error) {
+	log.Printf("RAG Query (Text Answer) for project %s: '%s'", projectID, userQuery)
+
+	// 1. Generate Embedding for the User Query
+	queryEmbedding, err := r.aiGenerator.GenerateEmbedding(ctx, userQuery)
+	if err != nil {
+		return "", fmt.Errorf("failed to generate embedding for query: %w", err)
+	}
+	if len(queryEmbedding) == 0 {
+		return "", errors.New("generated empty embedding vector for query")
+	}
+
+	// 2. Find Relevant Files/Chunks in Neo4j using Vector Search
+	topK := 5 // Number of relevant files/chunks to retrieve
+	relevantFileNodes, err := r.neo4jService.FindSimilarFiles(ctx, projectID, queryEmbedding, topK)
+	if err != nil {
+		if errors.Is(err, neo4j.ErrProjectNotFound) {
+			// Return specific error that the handler can check
+			return "", fmt.Errorf("project '%s' not found: %w", projectID, neo4j.ErrProjectNotFound)
+		}
+		return "", fmt.Errorf("failed to find relevant files via vector search: %w", err)
+	}
+
+	if len(relevantFileNodes) == 0 {
+		log.Printf("No relevant files found for query in project %s. Attempting answer without specific context.", projectID)
+		// Option 1: Return a standard message
+		// return "I looked through the project files but couldn't find specific code snippets related to your query. Can you provide more details or ask about a different part of the project?", nil
+		// Option 2: Call LLM without context (might hallucinate)
+		systemPromptNoContext := "You are an AI assistant. The user asked a question about a specific project, but no relevant files were found in the database. Answer the user's query generally if possible, or state that you cannot provide specifics without project context."
+		answer, err := r.aiGenerator.GenerateWithContext(ctx, systemPromptNoContext, userQuery, "No specific file context available.")
+		if err != nil {
+			return "", fmt.Errorf("failed to generate answer without context: %w", err)
+		}
+		return answer, nil
+	}
+
+	// 3. Construct Context from Retrieved Files for Textual Answer
+	var contextBuilder strings.Builder
+	contextBuilder.WriteString("Relevant code snippets from the project:\n\n")
+	for _, node := range relevantFileNodes {
+		props := node.Props
+		fileName, nameOk := props["name"].(string)
+		fileContent, contentOk := props["content"].(string)
+
+		if !nameOk || !contentOk {
+			log.Printf("WARN: Skipping node %d during RAG context building due to missing properties.", node.Id)
+			continue
+		}
+
+		contextBuilder.WriteString(fmt.Sprintf("--- File: %s ---\n", fileName))
+		maxCharsPerFile := 1500 // Increase context per file slightly
+		if len(fileContent) > maxCharsPerFile {
+			contextBuilder.WriteString(fileContent[:maxCharsPerFile])
+			contextBuilder.WriteString("...\n[Truncated]\n")
+		} else {
+			contextBuilder.WriteString(fileContent)
+			contextBuilder.WriteString("\n")
+		}
+		contextBuilder.WriteString("---\n\n")
+	}
+
+	// 4. Call LLM with Query and Context to Generate Final *Text* Answer
+	systemPrompt := "You are an AI assistant helping a user understand code for a web project. Use the provided code context to answer the user's query accurately and concisely. If the context doesn't fully answer the question, say so, but try to be helpful based on what is available."
+
+	answer, err := r.aiGenerator.GenerateWithContext(ctx, systemPrompt, userQuery, contextBuilder.String())
+	if err != nil {
+		return "", fmt.Errorf("failed to generate final text answer with LLM: %w", err)
+	}
+
+	log.Printf("Generated RAG text answer for project %s query.", projectID)
+	return answer, nil
+}
+
+// RefineProjectCode: Uses RAG to generate code modifications based on user query.
+func (r *RAGService) RefineProjectCode(ctx context.Context, projectID, userQuery string) ([]ai.GeneratedFile, error) {
+	log.Printf("RAG Code Refinement for project %s: '%s'", projectID, userQuery)
+
+	// 1. Generate Embedding for the User Query
+	queryEmbedding, err := r.aiGenerator.GenerateEmbedding(ctx, userQuery)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate embedding for refinement query: %w", err)
+	}
+	if len(queryEmbedding) == 0 {
+		return nil, errors.New("generated empty embedding vector for refinement query")
+	}
+
+	// 2. Find Relevant Files in Neo4j using Vector Search
+	topK := 5 // Retrieve top 5 relevant files
+	relevantFileNodes, err := r.neo4jService.FindSimilarFiles(ctx, projectID, queryEmbedding, topK)
+	if err != nil {
+		if errors.Is(err, neo4j.ErrProjectNotFound) {
+			return nil, fmt.Errorf("project '%s' not found: %w", projectID, neo4j.ErrProjectNotFound)
+		}
+		return nil, fmt.Errorf("failed to find relevant files for refinement: %w", err)
+	}
+
+	if len(relevantFileNodes) == 0 {
+		log.Printf("No relevant files found for refinement query in project %s. Cannot generate code changes without context.", projectID)
+		// Return an empty slice. The handler can inform the user.
+		return []ai.GeneratedFile{}, nil
+	}
+
+	// 3. Construct Context for the RAG Code Generation Prompt
+	var contextBuilder strings.Builder
+	retrievedFilenames := make(map[string]bool) // Track filenames to avoid duplicates
+	for _, node := range relevantFileNodes {
+		props := node.Props
+		fileName, nameOk := props["name"].(string)
+		fileContent, contentOk := props["content"].(string)
+
+		if !nameOk || !contentOk || retrievedFilenames[fileName] {
+			log.Printf("WARN: Skipping node %d during RAG refinement context building (missing props or duplicate filename '%s').", node.Id, fileName)
+			continue
+		}
+		retrievedFilenames[fileName] = true
+
+		// Format according to the RAG refinement prompt template
+		// Provide the full content here for the LLM to work with
+		contextBuilder.WriteString(fmt.Sprintf("File: %s\nContent:\n%s\n---\n\n", fileName, fileContent))
+	}
+
+	// Check if any context was actually built (e.g., if all nodes had bad data)
+	if contextBuilder.Len() == 0 {
+		log.Printf("WARN: No valid context could be built from retrieved files for project %s refinement.", projectID)
+		return []ai.GeneratedFile{}, nil // Return empty slice
+	}
+
+	// 4. Call the specific AI function designed for generating code changes
+	changedFiles, err := r.aiGenerator.GenerateCodeChanges(ctx, userQuery, contextBuilder.String())
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate code changes using LLM: %w", err)
+	}
+
+	log.Printf("Generated %d potential file changes/additions for project %s based on RAG.", len(changedFiles), projectID)
+
+	// 5. Optional Future Step: Validate/Merge changes with existing files in Neo4j.
+	// - Check if filenames returned by LLM actually exist or are new.
+	// - Potentially run code linters/formatters on the generated content.
+	// - Offer diffs to the user?
+	// For now, just return the raw suggestions from the LLM.
+
+	// Add fallback type determination if LLM didn't provide it
+	for i := range changedFiles {
+		if changedFiles[i].Type == "" {
+			changedFiles[i].Type = r.aiGenerator.determineFileType(changedFiles[i].Filename)
+		}
+	}
+
+	return changedFiles, nil
+}
