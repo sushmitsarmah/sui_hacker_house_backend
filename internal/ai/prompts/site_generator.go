@@ -31,7 +31,6 @@ func GetSiteGenerationPrompt() string {
 			*   ` + "`vite.config.ts`" + `: default Vite config
 			*   ` + "`package.json`" + `: default package json for all libraries and dependencies
 			*   ` + "`index.html`" + `: entry point HTML file for the application
-			
 
 		package.json should include all the libraries used in all the files including vite.config.ts and tailwind.config.ts.
 		include @vitejs/plugin-react and tailwindcss as dev dependencies.

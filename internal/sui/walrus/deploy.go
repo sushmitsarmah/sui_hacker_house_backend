@@ -70,7 +70,7 @@ func (d *Deployer) DeployFiles(ctx context.Context) (string, error) {
 
 	// 6. Run site-builder with the dist directory as input
 	// builderCmd := exec.CommandContext(ctx, d.siteBuilderPath, distDir) // Use dist directory as input
-	sitesConfigPath := filepath.Join(tempDir, "sites-config.yaml")
+	sitesConfigPath := "sites-config.yaml"
 	builderCmd := exec.CommandContext(
 		ctx,
 		d.siteBuilderPath,
