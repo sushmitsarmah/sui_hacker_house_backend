@@ -28,7 +28,7 @@ func (g *Generator) GenerateSiteAndStore(ctx context.Context, userPrompt, wallet
 	// 1. Construct the prompt using the template
 	fullPrompt := fmt.Sprintf(initialGenerationPromptTemplate, userPrompt)
 
-	log.Println("Full prompt for LLM:", fullPrompt) // Log the full prompt for debugging
+	// log.Println("Full prompt for LLM:", fullPrompt) // Log the full prompt for debugging
 
 	// 2. Call the LLM (e.g., OpenAI GPT-4o)
 	resp, err := g.client.CreateChatCompletion(

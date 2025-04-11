@@ -1,9 +1,11 @@
 package utils
 
 import (
+	"encoding/json"
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sui_ai_server/internal/types"
 	"sui_ai_server/internal/utils"
 )
@@ -26,8 +28,33 @@ func SaveFilesDisk(projectID string, generatedFiles []types.GeneratedFile) {
 		// Construct the full file path
 		filePath := filepath.Join("tmp", fileData.Filename)
 
-		// Write the file content
-		if err := os.WriteFile(filePath, []byte(fileData.Content), 0644); err != nil {
+		// Process content based on file type
+		content := fileData.Content
+
+		// If this is a JSON file, parse and format it properly
+		if fileType == "json" || strings.HasSuffix(strings.ToLower(fileData.Filename), ".json") {
+			// Try to parse the content as JSON
+			var jsonData interface{}
+			if err := json.Unmarshal([]byte(content), &jsonData); err != nil {
+				log.Printf("Warning: File %s has .json extension but contains invalid JSON: %v",
+					fileData.Filename, err)
+				// Continue saving the file as is, even though it's not valid JSON
+			} else {
+				// Format the JSON with proper indentation
+				formattedJSON, err := json.MarshalIndent(jsonData, "", "  ")
+				if err != nil {
+					log.Printf("Warning: Failed to format JSON for file %s: %v",
+						fileData.Filename, err)
+					// Continue with original content if formatting fails
+				} else {
+					// Use the properly formatted JSON
+					content = string(formattedJSON)
+				}
+			}
+		}
+
+		// Write the file content (original or processed)
+		if err := os.WriteFile(filePath, []byte(content), 0644); err != nil {
 			log.Printf("Failed to write file %s: %v", filePath, err)
 			continue
 		}
@@ -35,9 +62,11 @@ func SaveFilesDisk(projectID string, generatedFiles []types.GeneratedFile) {
 		log.Printf("File saved: %s", filePath)
 		filesCount++
 	}
+
 	log.Printf("Successfully stored project %s: %d files created", projectID, filesCount)
 	if filesCount != len(generatedFiles) {
-		log.Printf("WARN: Mismatch between parsed files (%d) and stored files (%d) for project %s.", len(generatedFiles), filesCount, projectID)
+		log.Printf("WARN: Mismatch between parsed files (%d) and stored files (%d) for project %s.",
+			len(generatedFiles), filesCount, projectID)
 	}
 }
 

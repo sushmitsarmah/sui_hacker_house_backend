@@ -25,117 +25,102 @@ func NewDeployer(siteBuilderPath, walrusCLIPath string) *Deployer {
 	}
 }
 
-// DeployFiles takes a map of filename->content, saves them, runs site-builder, and walrus publish.
-func (d *Deployer) DeployFiles(ctx context.Context, files map[string]string) (string, error) {
+// DeployFiles takes a map of filename->content, saves them, runs npm install, npm build, site-builder, and walrus publish.
+func (d *Deployer) DeployFiles(ctx context.Context) (string, error) {
 	// 1. Create a temporary directory for the project files
-	tempDir, err := os.MkdirTemp("", "walrus-deploy-*")
-	if err != nil {
-		return "", fmt.Errorf("failed to create temp dir: %w", err)
+	tempDir := "tmp"
+
+	// 3. Run npm install
+	npmInstallCmd := exec.CommandContext(ctx, "npm", "install")
+	npmInstallCmd.Dir = tempDir // Set working directory to our temp folder
+	var npmInstallStdErr bytes.Buffer
+	npmInstallCmd.Stderr = &npmInstallStdErr
+
+	log.Printf("Running npm install in %s", tempDir)
+	if err := npmInstallCmd.Run(); err != nil {
+		log.Printf("npm install stderr: %s", npmInstallStdErr.String())
+		return "", fmt.Errorf("npm install failed: %w (stderr: %s)", err, npmInstallStdErr.String())
 	}
-	defer os.RemoveAll(tempDir) // Clean up the temporary directory
+	log.Println("npm install completed successfully.")
 
-	log.Printf("Created temporary directory for deployment: %s", tempDir)
+	// 4. Run npm run build
+	npmBuildCmd := exec.CommandContext(ctx, "npm", "run", "build")
+	npmBuildCmd.Dir = tempDir // Set working directory to our temp folder
+	var npmBuildStdErr bytes.Buffer
+	npmBuildCmd.Stderr = &npmBuildStdErr
 
-	// 2. Write files to the temporary directory
-	for name, content := range files {
-		filePath := filepath.Join(tempDir, name)
-		// Ensure subdirectories exist (if any specified in filename like 'js/app.js')
-		if err := os.MkdirAll(filepath.Dir(filePath), 0755); err != nil {
-			return "", fmt.Errorf("failed to create subdirectories for %s: %w", name, err)
-		}
-		if err := os.WriteFile(filePath, []byte(content), 0644); err != nil {
-			return "", fmt.Errorf("failed to write file %s: %w", name, err)
-		}
+	log.Printf("Running npm run build in %s", tempDir)
+	if err := npmBuildCmd.Run(); err != nil {
+		log.Printf("npm run build stderr: %s", npmBuildStdErr.String())
+		return "", fmt.Errorf("npm run build failed: %w (stderr: %s)", err, npmBuildStdErr.String())
 	}
-	log.Printf("Wrote %d files to %s", len(files), tempDir)
+	log.Println("npm run build completed successfully.")
 
+	// 5. The build output should now be in tempDir/dist
+	distDir := filepath.Join(tempDir, "dist")
+	if _, err := os.Stat(distDir); os.IsNotExist(err) {
+		return "", fmt.Errorf("build process did not create expected dist directory at %s", distDir)
+	}
 
-	// 3. Run site-builder (if necessary - depends on what site-builder does)
-	// Assuming site-builder takes the source dir and outputs to a 'dist' subdir or similar
-	// Adjust command based on actual site-builder usage
-	builderCmd := exec.CommandContext(ctx, d.siteBuilderPath, tempDir) // Example usage
-    var builderStdErr bytes.Buffer
-    builderCmd.Stderr = &builderStdErr
-	log.Printf("Running site-builder: %s", builderCmd.String())
+	// 8. Get Wal token
+	getWal := exec.CommandContext(ctx, d.walrusCLIPath, "get-wal")
+	var publishStdOut, publishStdErr bytes.Buffer
+	getWal.Stdout = &publishStdOut
+	getWal.Stderr = &publishStdErr
+
+	// 6. Run site-builder with the dist directory as input
+	// builderCmd := exec.CommandContext(ctx, d.siteBuilderPath, distDir) // Use dist directory as input
+	sitesConfigPath := filepath.Join(tempDir, "sites-config.yaml")
+	builderCmd := exec.CommandContext(
+		ctx,
+		d.siteBuilderPath,
+		"--config",
+		sitesConfigPath,
+		"publish",
+		distDir,
+		"--epochs",
+		"2",
+	)
+	var builderStdOut, builderStdErr bytes.Buffer
+	builderCmd.Stderr = &builderStdErr
+
+	log.Printf("Running site-builder with tmp/dist folder: %s", builderCmd.String())
 	if err := builderCmd.Run(); err != nil {
-        log.Printf("site-builder stderr: %s", builderStdErr.String())
+		log.Printf("site-builder stderr: %s", builderStdErr.String())
 		return "", fmt.Errorf("site-builder failed: %w (stderr: %s)", err, builderStdErr.String())
 	}
 	log.Println("site-builder completed successfully.")
 
-    // Determine the directory to publish (might be tempDir or a sub-directory like 'dist')
-    publishDir := tempDir // Assume site-builder modifies in-place or we publish source
-    // If site-builder creates an output dir: publishDir = filepath.Join(tempDir, "dist")
-
-
-	// 4. Run walrus publish
-	// TODO: Add WAL token funding logic here if required before publishing.
-	// This might involve calling another CLI command, interacting with a wallet service, etc.
-
-	// Command: walrus publish <directory>
-	publishCmd := exec.CommandContext(ctx, d.walrusCLIPath, "publish", publishDir)
-	var publishStdOut, publishStdErr bytes.Buffer
-	publishCmd.Stdout = &publishStdOut
-	publishCmd.Stderr = &publishStdErr
-
-	log.Printf("Running walrus publish: %s", publishCmd.String())
-	if err := publishCmd.Run(); err != nil {
-        log.Printf("walrus publish stderr: %s", publishStdErr.String())
-		return "", fmt.Errorf("walrus publish failed: %w (stderr: %s)", err, publishStdErr.String())
+	// Extract the site object ID from the output
+	builderOutput := builderStdOut.String()
+	log.Printf("site-builder stdout: %s", builderOutput)
+	siteObjectID := extractSiteObjectID(builderOutput)
+	if siteObjectID == "" {
+		return "", fmt.Errorf("failed to extract site object ID from site-builder output")
 	}
 
-    output := publishStdOut.String()
-	log.Printf("walrus publish stdout: %s", output)
+	log.Printf("Site object ID: %s", siteObjectID)
+	log.Println("site-builder completed successfully.")
 
-
-	// 5. Parse CID from walrus publish output
-	// Example: Output might be "Published to ipfs://<CID>" or just <CID>
-    cid := extractCID(output) // Implement this parsing function
-    if cid == "" {
-        log.Printf("walrus publish stderr: %s", publishStdErr.String()) // Log stderr too if CID extraction fails
-        return "", fmt.Errorf("failed to extract CID from walrus publish output: %s", output)
-    }
-
-	log.Printf("Extracted CID: %s", cid)
-	return cid, nil
+	// Since we now want to return the site object ID instead of a CID,
+	// we'll skip the walrus publish step and return the site object ID directly
+	return siteObjectID, nil
 }
 
-// extractCID parses the output of `walrus publish` to find the CID.
-// This needs to be adapted based on the *actual* output format.
-func extractCID(output string) string {
-    // Option 1: Simple prefix check (if output is like "Published: bafy...")
-    prefix := "Published: "
-    if strings.HasPrefix(output, prefix) {
-        return strings.TrimSpace(strings.TrimPrefix(output, prefix))
-    }
+// extractSiteObjectID parses the output of site-builder to find the site object ID.
+func extractSiteObjectID(output string) string {
+	// Looking for the line with "New site object ID: 0x..."
+	lines := strings.Split(output, "\n")
+	prefix := "New site object ID: "
 
-    // Option 2: Look for ipfs:// prefix
-    ipfsPrefix := "ipfs://"
-    if idx := strings.Index(output, ipfsPrefix); idx != -1 {
-        line := output[idx:] // Get the rest of the line/output from ipfs://
-        parts := strings.Fields(line) // Split by space
-        if len(parts) > 0 {
-            cid := strings.TrimPrefix(parts[0], ipfsPrefix)
-            return cid
-        }
-    }
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, prefix) {
+			// Extract the ID which follows the prefix
+			objectID := strings.TrimPrefix(line, prefix)
+			return objectID
+		}
+	}
 
-    // Option 3: Assume the last word is the CID (less robust)
-    lines := strings.Split(strings.TrimSpace(output), "\n")
-    if len(lines) > 0 {
-        lastLine := lines[len(lines)-1]
-        parts := strings.Fields(lastLine)
-        if len(parts) > 0 {
-            // Basic check if it looks like a CID (e.g., starts with "bafy" or "Qm")
-            potentialCID := parts[len(parts)-1]
-            if strings.HasPrefix(potentialCID, "bafy") || strings.HasPrefix(potentialCID, "Qm") {
-                 return potentialCID
-            }
-        }
-    }
-
-
-    // Add more robust parsing based on actual CLI output format
-    log.Printf("WARN: Could not extract CID using known patterns from output: %s", output)
-    return "" // Indicate failure
+	return ""
 }

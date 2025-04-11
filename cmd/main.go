@@ -20,11 +20,12 @@ import (
 	"sui_ai_server/config"
 	"sui_ai_server/internal/ai"
 	"sui_ai_server/internal/api"
+
 	// neo4jRepo "sui_ai_server/db/neo4j" // Alias to avoid name collision
 	// "sui_ai_server/events"
 	// "sui_ai_server/rag"
 	// "sui_ai_server/sui/seal" // Import sui service package
-	// "sui_ai_server/sui/walrus"
+	"sui_ai_server/internal/sui/walrus"
 )
 
 func main() {
@@ -98,7 +99,7 @@ func main() {
 	// ragService := rag.NewRAGService(neo4jService, aiGenerator, cfg.EmbeddingModelID) // AI Generator needed for embeddings
 
 	// Initialize Walrus Deployer
-	// walrusDeployer := walrus.NewDeployer(cfg.SiteBuilderPath, cfg.WalrusCLIPath) // Add wallet/token logic if needed
+	walrusDeployer := walrus.NewDeployer(cfg.SiteBuilderPath, cfg.WalrusCLIPath) // Add wallet/token logic if needed
 
 	// Initialize Seal Client
 	// sealClient := seal.NewClient(cfg.SealAPIKey, cfg.SealEndpoint) // Adjust with actual SDK/API details
@@ -118,7 +119,7 @@ func main() {
 	apiHandler := api.NewAPIHandler(
 		aiGenerator,
 		// neo4jService,
-		// walrusDeployer,
+		walrusDeployer,
 		// sealClient,
 		// ragService,
 		cfg.SuiNetwork,           // Pass network name
