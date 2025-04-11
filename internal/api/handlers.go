@@ -127,8 +127,8 @@ func (h *APIHandler) GenerateSite(c *gin.Context) {
 	}
 
 	log.Printf("Site generation successful for wallet %s. Project ID: %s", req.Wallet, projectID)
-	c.JSON(http.StatusCreated, GenerateResponse{ProjectID: projectID}) // Use 201 Created
 
+	// Move the response after we have both projectID and cid
 	cid, err := h.walrusDeployer.DeployFiles(c.Request.Context())
 	if err != nil {
 		log.Printf("Error deploying project %s to Walrus: %v", projectID, err)
@@ -137,4 +137,9 @@ func (h *APIHandler) GenerateSite(c *gin.Context) {
 	}
 	log.Printf("Project %s deployed successfully. CID: %s", projectID, cid)
 
+	// Return both projectID and cid in the response
+	c.JSON(http.StatusCreated, gin.H{
+		"projectID": projectID,
+		"cid":       cid,
+	})
 }
