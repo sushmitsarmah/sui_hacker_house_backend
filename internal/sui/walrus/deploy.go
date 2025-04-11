@@ -83,6 +83,7 @@ func (d *Deployer) DeployFiles(ctx context.Context) (string, error) {
 	)
 	var builderStdOut, builderStdErr bytes.Buffer
 	builderCmd.Stderr = &builderStdErr
+	builderCmd.Stdout = &builderStdOut
 
 	log.Printf("Running site-builder with tmp/dist folder: %s", builderCmd.String())
 	if err := builderCmd.Run(); err != nil {
