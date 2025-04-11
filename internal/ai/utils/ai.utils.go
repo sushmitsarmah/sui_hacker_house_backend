@@ -1,15 +1,14 @@
 package utils
 
 import (
-	"fmt"
 	"log"
 	"os"
 	"path/filepath"
-	"sui_ai_server/internal/ai"
+	"sui_ai_server/internal/types"
 	"sui_ai_server/internal/utils"
 )
 
-func SaveFilesDisk(projectID string, generatedFiles []ai.GeneratedFile) {
+func SaveFilesDisk(projectID string, generatedFiles []types.GeneratedFile) {
 	filesCount := 0
 	for _, fileData := range generatedFiles {
 		fileType := fileData.Type
@@ -17,15 +16,15 @@ func SaveFilesDisk(projectID string, generatedFiles []ai.GeneratedFile) {
 			fileType = utils.DetermineFileType(fileData.Filename) // Fallback
 		}
 
-		// Create a temporary directory
-		tmpDir := filepath.Join("tmp")
-		if err := os.MkdirAll(tmpDir, os.ModePerm); err != nil {
-			log.Printf("Failed to create temporary directory: %v", err)
+		// Create the full directory path within the tmp directory
+		fullDirPath := filepath.Join("tmp", filepath.Dir(fileData.Filename))
+		if err := os.MkdirAll(fullDirPath, os.ModePerm); err != nil {
+			log.Printf("Failed to create directory path: %v", err)
 			continue
 		}
 
-		// Construct the file path
-		filePath := filepath.Join(tmpDir, fmt.Sprintf("%s.%s", fileData.Filename, fileType))
+		// Construct the full file path
+		filePath := filepath.Join("tmp", fileData.Filename)
 
 		// Write the file content
 		if err := os.WriteFile(filePath, []byte(fileData.Content), 0644); err != nil {
@@ -42,7 +41,7 @@ func SaveFilesDisk(projectID string, generatedFiles []ai.GeneratedFile) {
 	}
 }
 
-func SaveToRAG(projectID string, generatedFiles []ai.GeneratedFile) {
+func SaveToRAG(projectID string, generatedFiles []types.GeneratedFile) {
 	filesCount := 0
 	embeddingsCount := 0
 	// 4. Create Project node in Neo4j

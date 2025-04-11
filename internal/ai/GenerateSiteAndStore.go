@@ -8,8 +8,11 @@ import (
 	"log"
 	"strings"
 	"sui_ai_server/internal/ai/prompts"
+	"sui_ai_server/internal/types"
 	"sui_ai_server/internal/utils"
 	"time"
+
+	ai_utils "sui_ai_server/internal/ai/utils"
 
 	"github.com/google/uuid"
 	openai "github.com/sashabaranov/go-openai"
@@ -77,7 +80,7 @@ func (g *Generator) GenerateSiteAndStore(ctx context.Context, userPrompt, wallet
 	llmOutput := resp.Choices[0].Message.Content
 	log.Printf("LLM raw output for project %s: %s", projectID, llmOutput) // Log raw output for debugging
 
-	var generatedFiles []GeneratedFile
+	var generatedFiles []types.GeneratedFile
 
 	cleanedOutput := strings.TrimSpace(llmOutput)
 	cleanedOutput = strings.TrimPrefix(cleanedOutput, "```json")
@@ -94,12 +97,12 @@ func (g *Generator) GenerateSiteAndStore(ctx context.Context, userPrompt, wallet
 		log.Printf("Info: Failed to parse as array (%v), trying single object for project %s.", err, projectID)
 
 		// Attempt 2: Try parsing as a single object
-		var singleFile GeneratedFile
+		var singleFile types.GeneratedFile
 		errSingle := json.Unmarshal([]byte(cleanedOutput), &singleFile)
 		if errSingle == nil {
 			log.Printf("Parsed LLM output as a single JSON object for project %s.", projectID)
 			// Success! Wrap the single object in a slice.
-			generatedFiles = []GeneratedFile{singleFile}
+			generatedFiles = []types.GeneratedFile{singleFile}
 			err = nil // Clear the error from the failed array parse attempt
 		} else {
 			// If single object parsing also failed, try the wrapped array logic (your original fallback)
@@ -159,7 +162,9 @@ func (g *Generator) GenerateSiteAndStore(ctx context.Context, userPrompt, wallet
 
 	log.Printf("Successfully parsed %d files from LLM for project %s", len(generatedFiles), projectID)
 
-	log.Println(generatedFiles)
+	// log.Println(generatedFiles)
+
+	ai_utils.SaveFilesDisk(projectID, generatedFiles)
 
 	return projectID, nil
 }

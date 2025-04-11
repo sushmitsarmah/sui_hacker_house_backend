@@ -8,6 +8,7 @@ import (
 	"log"
 	"strings"
 	"sui_ai_server/internal/ai/prompts"
+	"sui_ai_server/internal/types"
 	"sui_ai_server/internal/utils"
 	"time"
 
@@ -15,7 +16,7 @@ import (
 )
 
 // GenerateCodeChanges - Specific function for RAG refinement prompt to get code edits.
-func (g *Generator) GenerateCodeChanges(ctx context.Context, userQuery string, contextFiles string) ([]GeneratedFile, error) {
+func (g *Generator) GenerateCodeChanges(ctx context.Context, userQuery string, contextFiles string) ([]types.GeneratedFile, error) {
 	fullPrompt, ragSystemPrompt := prompts.GetSiteCodeChangePrompt(userQuery, contextFiles)
 
 	req := openai.ChatCompletionRequest{
@@ -51,7 +52,7 @@ func (g *Generator) GenerateCodeChanges(ctx context.Context, userQuery string, c
 	llmOutput := resp.Choices[0].Message.Content
 	log.Printf("LLM raw output for code changes: %s", llmOutput)
 
-	var changedFiles []GeneratedFile
+	var changedFiles []types.GeneratedFile
 	cleanedOutput := strings.TrimSpace(llmOutput)
 	cleanedOutput = strings.TrimPrefix(cleanedOutput, "```json")
 	cleanedOutput = strings.TrimSuffix(cleanedOutput, "```")

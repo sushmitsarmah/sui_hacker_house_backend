@@ -8,6 +8,8 @@ import (
 
 	// "strings"          // Import strings
 	"sui_ai_server/internal/ai" // Import ai package
+	"sui_ai_server/internal/types"
+
 	// "sui_ai_server/db/neo4j"
 	// "sui_ai_server/rag"
 	// "sui_ai_server/sui" // NEW: Import sui interaction package
@@ -88,7 +90,7 @@ type RAGQueryResponse struct { // For text answers
 }
 
 type RefineCodeResponse struct { // For code change suggestions
-	Files []ai.GeneratedFile `json:"files"` // Return the array of file objects
+	Files []types.GeneratedFile `json:"files"` // Return the array of file objects
 }
 
 type RegisterSuinsRequest struct {
