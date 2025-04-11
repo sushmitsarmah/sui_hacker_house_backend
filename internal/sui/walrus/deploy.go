@@ -91,6 +91,8 @@ func (d *Deployer) DeployFiles(ctx context.Context) (string, error) {
 	}
 	log.Println("site-builder completed successfully.")
 
+	println("site-builder stdout: ", builderStdOut.String())
+
 	// Extract the site object ID from the output
 	builderOutput := builderStdOut.String()
 	log.Printf("site-builder stdout: %s", builderOutput)
